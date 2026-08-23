@@ -11,12 +11,12 @@ from enum import Enum
 from importlib.metadata import version
 from inspect import Parameter, Signature
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Literal, cast
+from types import ModuleType, SimpleNamespace
+from typing import Any, Literal, TypeAlias, cast
 
 import pytest
 from pydantic import BaseModel, Field
-from typing_extensions import Required, TypedDict
+from typing_extensions import Required, TypeAliasType, TypedDict
 
 import integration_tests._contract_support as contract_support
 from integration_tests._contract_support import (
@@ -594,6 +594,187 @@ def test_curated_public_type_alias_contract_records_and_validates_members(
                 ),
             ),
         )
+
+
+def test_new_top_level_type_alias_requires_explicit_policy() -> None:
+    existing_alias = Literal["existing"]
+    new_alias = Callable[[str], str | None]
+    agents_module = SimpleNamespace(
+        __all__=["ExistingAlias", "NewAlias"],
+        ExistingAlias=existing_alias,
+        NewAlias=new_alias,
+    )
+    contract: dict[str, Any] = {
+        "baseline": "v0.19.4",
+        "baseline_commit": "a" * 40,
+        "required_top_level_exports": ["ExistingAlias"],
+        "public_modules": ["agents"],
+        "canonical_imports": [],
+        "public_class_contracts": [],
+        "public_properties": [],
+        "public_type_aliases": [],
+        "public_typed_dicts": [],
+        "callables": {},
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        build_released_api_contract(
+            contract,
+            baseline="v0.20.0",
+            baseline_commit="b" * 40,
+            agents_module=agents_module,
+            release_policy=_release_policy({}),
+        )
+
+    assert str(exc_info.value) == (
+        "Cannot promote new top-level type aliases without public_type_aliases policy entries "
+        "for module 'agents': ['NewAlias']"
+    )
+
+    updated = build_released_api_contract(
+        contract,
+        baseline="v0.20.0",
+        baseline_commit="b" * 40,
+        agents_module=agents_module,
+        release_policy=_release_policy(
+            {},
+            public_type_aliases=({"module": "agents", "name": "NewAlias"},),
+        ),
+    )
+
+    assert updated["public_type_aliases"] == [
+        {
+            "definition": {
+                "kind": "callable",
+                "parameters": [{"identity": "builtins.str", "kind": "type"}],
+                "return": {
+                    "kind": "union",
+                    "members": [
+                        {"identity": "builtins.NoneType", "kind": "type"},
+                        {"identity": "builtins.str", "kind": "type"},
+                    ],
+                },
+            },
+            "module": "agents",
+            "name": "NewAlias",
+        }
+    ]
+
+    agents_module.NewAlias = Callable[[bytes], str | None]
+    errors = _validate_public_type_alias_contract(updated, agents_module)
+    assert len(errors) == 1
+    assert errors[0].startswith("agents.NewAlias changed its released public type alias")
+
+
+def test_new_originless_explicit_type_alias_requires_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExistingClass:
+        pass
+
+    class NewClass:
+        pass
+
+    source_module = ModuleType("synthetic_agents.aliases")
+    source_module.TypeAlias = TypeAlias
+    source_module.__annotations__ = {"NewAlias": "TypeAlias"}
+    source_module.NewAlias = str
+    agents_module = ModuleType("synthetic_agents")
+    agents_module.__all__ = ["ExistingClass", "NewAlias", "NewClass"]
+    agents_module.ExistingClass = ExistingClass
+    agents_module.NewAlias = source_module.NewAlias
+    agents_module.NewClass = NewClass
+    monkeypatch.setitem(sys.modules, source_module.__name__, source_module)
+    contract: dict[str, Any] = {
+        "baseline": "v0.19.4",
+        "baseline_commit": "a" * 40,
+        "required_top_level_exports": ["ExistingClass"],
+        "public_modules": ["agents"],
+        "canonical_imports": [],
+        "public_class_contracts": [],
+        "public_properties": [],
+        "public_type_aliases": [],
+        "public_typed_dicts": [],
+        "callables": {},
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        build_released_api_contract(
+            contract,
+            baseline="v0.20.0",
+            baseline_commit="b" * 40,
+            agents_module=agents_module,
+            release_policy=_release_policy({}),
+        )
+
+    assert str(exc_info.value) == (
+        "Cannot promote new top-level type aliases without public_type_aliases policy entries "
+        "for module 'agents': ['NewAlias']"
+    )
+
+    updated = build_released_api_contract(
+        contract,
+        baseline="v0.20.0",
+        baseline_commit="b" * 40,
+        agents_module=agents_module,
+        release_policy=_release_policy(
+            {},
+            public_type_aliases=({"module": "agents", "name": "NewAlias"},),
+        ),
+    )
+    assert updated["public_type_aliases"] == [
+        {
+            "definition": {"identity": "builtins.str", "kind": "type"},
+            "module": "agents",
+            "name": "NewAlias",
+        }
+    ]
+
+    agents_module.NewAlias = bytes
+    errors = _validate_public_type_alias_contract(updated, agents_module)
+    assert len(errors) == 1
+    assert errors[0].startswith("agents.NewAlias changed its released public type alias")
+
+
+def test_new_type_alias_type_requires_policy() -> None:
+    new_alias = TypeAliasType("NewAlias", str)
+    agents_module = SimpleNamespace(__all__=["NewAlias"], NewAlias=new_alias)
+    contract: dict[str, Any] = {
+        "baseline": "v0.19.4",
+        "baseline_commit": "a" * 40,
+        "required_top_level_exports": [],
+        "public_modules": ["agents"],
+        "canonical_imports": [],
+        "public_class_contracts": [],
+        "public_properties": [],
+        "public_type_aliases": [],
+        "public_typed_dicts": [],
+        "callables": {},
+    }
+
+    with pytest.raises(ValueError, match="for module 'agents': \\['NewAlias'\\]"):
+        build_released_api_contract(
+            contract,
+            baseline="v0.20.0",
+            baseline_commit="b" * 40,
+            agents_module=agents_module,
+            release_policy=_release_policy({}),
+        )
+
+    updated = build_released_api_contract(
+        contract,
+        baseline="v0.20.0",
+        baseline_commit="b" * 40,
+        agents_module=agents_module,
+        release_policy=_release_policy(
+            {},
+            public_type_aliases=({"module": "agents", "name": "NewAlias"},),
+        ),
+    )
+    assert updated["public_type_aliases"][0]["definition"] == {
+        "identity": "builtins.str",
+        "kind": "type",
+    }
 
 
 def test_curated_public_typed_dict_contract_detects_field_shape_drift(
@@ -3088,6 +3269,10 @@ def test_repository_release_policy_declares_public_state_surfaces() -> None:
             "module": "agents.voice.events",
             "name": "VoiceStreamEvent",
         },
+        {
+            "module": "agents",
+            "name": "OutputGuardrailBlockedMessageFormatter",
+        },
     )
     type_aliases: dict[tuple[str, str], dict[str, Any]] = {
         (cast(str, entry["module"]), cast(str, entry["name"])): cast(
@@ -3126,6 +3311,24 @@ def test_repository_release_policy_declares_public_state_surfaces() -> None:
         "agents.voice.events.VoiceStreamEventAudio",
         "agents.voice.events.VoiceStreamEventError",
         "agents.voice.events.VoiceStreamEventLifecycle",
+    }
+    blocked_message_formatter = type_aliases[("agents", "OutputGuardrailBlockedMessageFormatter")]
+    assert blocked_message_formatter == {
+        "kind": "callable",
+        "parameters": [
+            {
+                "arguments": [{"kind": "any"}],
+                "kind": "generic",
+                "origin": "agents.run_config.OutputGuardrailBlockedMessageArgs",
+            }
+        ],
+        "return": {
+            "kind": "union",
+            "members": [
+                {"identity": "builtins.NoneType", "kind": "type"},
+                {"identity": "builtins.str", "kind": "type"},
+            ],
+        },
     }
     assert policy.public_typed_dicts == (
         {

@@ -8,12 +8,23 @@ import json
 import logging
 import sys
 import traceback
+import typing
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from importlib.util import find_spec
 from pathlib import Path
-from types import FunctionType, TracebackType, UnionType
-from typing import Any, ForwardRef, Literal, Union, cast, get_args, get_origin, get_type_hints
+from types import FunctionType, ModuleType, TracebackType, UnionType
+from typing import (
+    Any,
+    ForwardRef,
+    Literal,
+    TypeAlias,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 import typing_extensions
 from pydantic import BaseModel
@@ -888,7 +899,76 @@ def _sorted_type_alias_members(members: Iterable[dict[str, object]]) -> list[dic
     )
 
 
+def _is_type_alias_type(value: object) -> bool:
+    native_type_alias_type = getattr(typing, "TypeAliasType", typing_extensions.TypeAliasType)
+    return isinstance(value, typing_extensions.TypeAliasType | native_type_alias_type)
+
+
+def _is_type_alias_annotation(annotation: object, module: object) -> bool:
+    if annotation is TypeAlias or annotation is typing_extensions.TypeAlias:
+        return True
+    if not isinstance(annotation, str):
+        return False
+    reference_parts = annotation.split(".")
+    if not reference_parts or not all(part.isidentifier() for part in reference_parts):
+        return False
+    missing = object()
+    resolved = getattr(module, reference_parts[0], missing)
+    for part in reference_parts[1:]:
+        if resolved is missing:
+            break
+        resolved = getattr(resolved, part, missing)
+    return resolved is TypeAlias or resolved is typing_extensions.TypeAlias
+
+
+def _trusted_agent_modules(agents_module: object) -> Iterable[object]:
+    yield agents_module
+    package_name = getattr(agents_module, "__name__", None)
+    if not isinstance(package_name, str):
+        return
+    package_prefix = f"{package_name}."
+    for module_name, module in sorted(sys.modules.items()):
+        if (
+            module is not agents_module
+            and isinstance(module, ModuleType)
+            and module_name.startswith(package_prefix)
+        ):
+            yield module
+
+
+def _has_explicit_type_alias_declaration(
+    agents_module: object, export_name: str, value: object
+) -> bool:
+    missing = object()
+    value_name = getattr(value, "__name__", None)
+    for module in _trusted_agent_modules(agents_module):
+        annotations = getattr(module, "__annotations__", {})
+        if not isinstance(annotations, Mapping):
+            continue
+        for alias_name, annotation in annotations.items():
+            if (
+                isinstance(alias_name, str)
+                and _is_type_alias_annotation(annotation, module)
+                and getattr(module, alias_name, missing) is value
+                and (alias_name == export_name or export_name != value_name)
+            ):
+                return True
+    return False
+
+
+def _is_public_type_alias(agents_module: object, export_name: str, value: object) -> bool:
+    return (
+        get_origin(value) is not None
+        or _is_type_alias_type(value)
+        or _has_explicit_type_alias_declaration(agents_module, export_name, value)
+    )
+
+
 def _type_alias_definition(value: object) -> dict[str, object]:
+    if value is Any:
+        return {"kind": "any"}
+    if _is_type_alias_type(value):
+        return _type_alias_definition(value.__value__)
     origin = get_origin(value)
     if origin is Literal:
         literal_values: list[dict[str, object]] = []
@@ -909,8 +989,36 @@ def _type_alias_definition(value: object) -> dict[str, object]:
             "kind": "union",
             "members": _sorted_type_alias_members(members),
         }
+    if origin is Callable:
+        callable_args = get_args(value)
+        if len(callable_args) != 2:
+            raise TypeError(
+                "public Callable type aliases must declare parameters and a return type"
+            )
+        parameter_types, return_type = callable_args
+        if parameter_types is Ellipsis or not isinstance(parameter_types, list | tuple):
+            raise TypeError("public Callable type aliases must declare explicit parameter types")
+        return {
+            "kind": "callable",
+            "parameters": [
+                _type_alias_definition(parameter_type) for parameter_type in parameter_types
+            ],
+            "return": _type_alias_definition(return_type),
+        }
+    if origin is not None:
+        if not isinstance(origin, type) or not (
+            origin.__module__ == "agents" or origin.__module__.startswith("agents.")
+        ):
+            raise TypeError(f"unsupported public generic type alias origin: {origin!r}")
+        return {
+            "kind": "generic",
+            "origin": f"{origin.__module__}.{origin.__qualname__}",
+            "arguments": [_type_alias_definition(argument) for argument in get_args(value)],
+        }
     if isinstance(value, type) and (
-        value.__module__ == "agents" or value.__module__.startswith("agents.")
+        value.__module__ == "builtins"
+        or value.__module__ == "agents"
+        or value.__module__.startswith("agents.")
     ):
         return {
             "kind": "type",
@@ -1210,6 +1318,24 @@ def build_released_api_contract(
     released_export_order = list(contract["required_top_level_exports"])
     released_exports = set(released_export_order)
     current_export_names = set(current_exports)
+    if release_policy is not None:
+        promoted_top_level_type_aliases = {
+            entry["name"]
+            for entry in release_policy.public_type_aliases
+            if entry["module"] == "agents"
+        }
+        missing_top_level_type_aliases = sorted(
+            name
+            for name in current_export_names - released_exports
+            if _is_public_type_alias(agents, name, getattr(agents, name))
+            and name not in promoted_top_level_type_aliases
+        )
+        if missing_top_level_type_aliases:
+            raise ValueError(
+                "Cannot promote new top-level type aliases without public_type_aliases policy "
+                "entries for module 'agents': "
+                f"{missing_top_level_type_aliases!r}"
+            )
     ordered_exports = [name for name in released_export_order if name in current_export_names]
     ordered_exports.extend(name for name in current_exports if name not in released_exports)
     tracked_callables = set(contract["callables"])
